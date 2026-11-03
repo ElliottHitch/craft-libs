@@ -120,6 +120,13 @@ impl Drop for Staging {
 }
 
 fn extract(file: &Path, destination: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let (files, entries, _) = extract_with_hashes(file, destination, false)?;
+    Ok((files, entries))
+}
+
+fn extract_with_hashes(file: &Path, destination: &Path, verify: bool) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<String>), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
     let file = std::fs::File::open(file).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("couldn't read the portable ZIP ({e})"))?;
     if archive.len() > MAX_FILES {
@@ -127,6 +134,7 @@ fn extract(file: &Path, destination: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf
     }
     let mut files = Vec::new();
     let mut entries = Vec::new();
+    let mut hashes = Vec::new();
     let mut total = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     for index in 0..archive.len() {
@@ -152,16 +160,37 @@ fn extract(file: &Path, destination: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&target).map_err(|e| e.to_string())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if verify {
+            options.read(true).share_mode(FILE_SHARE_READ);
+        }
+        let mut output = options.open(&target).map_err(|e| e.to_string())?;
         use std::io::Read;
         let declared = entry.size();
         let copied = std::io::copy(&mut (&mut entry).take(declared.saturating_add(1)), &mut output).map_err(|e| e.to_string())?;
         if copied != declared {
             return Err("The portable ZIP has an unexpected unpacked size.".into());
         }
+        if verify {
+            hashes.push(file_digest(&mut output)?);
+        }
         files.push(relative);
     }
-    Ok((files, entries))
+    Ok((files, entries, hashes))
+}
+
+const FILE_SHARE_READ: u32 = 1;
+
+fn file_digest(file: &mut std::fs::File) -> Result<String, String> {
+    use std::io::{Seek, SeekFrom};
+
+    use sha2::{Digest, Sha256};
+
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    std::io::copy(file, &mut digest).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn recorded_files<'a>(app: &App, record: &'a Record) -> Result<(&'a Path, Vec<PathBuf>), String> {
@@ -364,6 +393,22 @@ pub fn unpack_over(
     executable: &std::ffi::OsStr,
     check: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
+    unpack_over_with_verification(zip, staging, folder, executable, check, false)
+}
+
+/// Replaces a portable app from an already verified ZIP which remains locked by the caller.
+pub(crate) fn unpack_verified_over(zip: &Path, staging: &Path, folder: &Path, executable: &std::ffi::OsStr) -> Result<(), String> {
+    unpack_over_with_verification(zip, staging, folder, executable, &|_| Ok(()), true)
+}
+
+fn unpack_over_with_verification(
+    zip: &Path,
+    staging: &Path,
+    folder: &Path,
+    executable: &std::ffi::OsStr,
+    check: &dyn Fn(&Path) -> Result<(), String>,
+    verify: bool,
+) -> Result<(), String> {
     let backup = staging.join("backup");
     // A failed update whose files couldn't be moved to a recovery folder: never clear them.
     if backup.exists() {
@@ -371,13 +416,17 @@ pub fn unpack_over(
     }
     let _ = std::fs::remove_dir_all(staging);
     let mut keep = false;
-    let result = replace_with(zip, staging, folder, executable, check, &mut keep);
+    let mut held_files = Vec::new();
+    let mut held_directories = std::collections::BTreeMap::new();
+    let result = replace_with(zip, staging, folder, executable, check, &mut keep, verify, &mut held_files, &mut held_directories);
     if !keep {
         let _ = std::fs::remove_dir_all(staging);
     }
+    drop((held_files, held_directories));
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_with(
     zip: &Path,
     staging: &Path,
@@ -385,11 +434,14 @@ fn replace_with(
     executable: &std::ffi::OsStr,
     check: &dyn Fn(&Path) -> Result<(), String>,
     keep: &mut bool,
+    verify: bool,
+    held_files: &mut Vec<std::fs::File>,
+    held_directories: &mut std::collections::BTreeMap<PathBuf, std::fs::File>,
 ) -> Result<(), String> {
     let unpacked = staging.join("unpacked");
     let backup = staging.join("backup");
     std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
-    let (files, _) = extract(zip, &unpacked)?;
+    let (files, _, hashes) = extract_with_hashes(zip, &unpacked, verify)?;
     let top = single_top_folder(&files);
     let files = files
         .into_iter()
@@ -410,20 +462,40 @@ fn replace_with(
     let mut saved = Vec::new();
     let mut created = Vec::new();
     let copied = (|| {
-        for (relative, inside) in &files {
+        for (index, (relative, inside)) in files.iter().enumerate() {
             let target = folder.join(inside);
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                if verify {
+                    hold_directory_chain(folder, parent, held_directories)?;
+                } else {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
             }
-            if target.is_file() {
-                let previous = backup.join(inside);
-                std::fs::create_dir_all(previous.parent().ok_or("no backup folder")?).map_err(|e| e.to_string())?;
-                std::fs::copy(&target, &previous).map_err(|e| e.to_string())?;
-                saved.push(inside.to_path_buf());
+            if verify {
+                let expected = hashes.get(index).ok_or("The portable ZIP could not be verified.")?;
+                let source_file = open_verified_source(&unpacked.join(relative), expected)?;
+                let (mut target_file, existed) = open_verified_target(&target)?;
+                if existed {
+                    let previous = backup.join(inside);
+                    std::fs::create_dir_all(previous.parent().ok_or("no backup folder")?).map_err(|e| e.to_string())?;
+                    let mut backup_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&previous).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut target_file, &mut backup_file).map_err(|e| e.to_string())?;
+                    saved.push(inside.to_path_buf());
+                } else {
+                    created.push(target.clone());
+                }
+                held_files.push(copy_verified(source_file, target_file, &target, expected)?);
             } else {
-                created.push(target.clone());
+                if target.is_file() {
+                    let previous = backup.join(inside);
+                    std::fs::create_dir_all(previous.parent().ok_or("no backup folder")?).map_err(|e| e.to_string())?;
+                    std::fs::copy(&target, &previous).map_err(|e| e.to_string())?;
+                    saved.push(inside.to_path_buf());
+                } else {
+                    created.push(target.clone());
+                }
+                std::fs::copy(unpacked.join(relative), &target).map_err(|e| format!("couldn't replace {} ({e})", target.display()))?;
             }
-            std::fs::copy(unpacked.join(relative), &target).map_err(|e| format!("couldn't replace {} ({e})", target.display()))?;
         }
         // Keep the previous files until the installed copies have passed the same checks.
         for (_, inside) in &files {
@@ -432,6 +504,7 @@ fn replace_with(
         Ok::<(), String>(())
     })();
     if let Err(error) = copied {
+        held_files.clear();
         for target in &created {
             let _ = std::fs::remove_file(target);
         }
@@ -457,6 +530,103 @@ fn replace_with(
         return Err(error);
     }
     Ok(())
+}
+
+fn hold_directory_chain(root: &Path, parent: &Path, held: &mut std::collections::BTreeMap<PathBuf, std::fs::File>) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let relative = parent.strip_prefix(root).map_err(|_| "An installation path points outside its folder.")?;
+    if relative.components().any(|part| !matches!(part, Component::Normal(_))) {
+        return Err("An installation path contains an unsafe component.".into());
+    }
+    let mut current = root.to_path_buf();
+    let mut paths = vec![current.clone()];
+    for part in relative.components() {
+        current.push(part.as_os_str());
+        paths.push(current.clone());
+    }
+    for (index, path) in paths.into_iter().enumerate() {
+        if held.contains_key(&path) {
+            continue;
+        }
+        if index > 0 {
+            match std::fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .map_err(|e| format!("couldn't secure the installation folder {} ({e})", path.display()))?;
+        let meta = directory.metadata().map_err(|e| e.to_string())?;
+        if linked(&meta) || !meta.is_dir() {
+            return Err("The installation folder contains a link or a non-directory component.".into());
+        }
+        held.insert(path, directory);
+    }
+    Ok(())
+}
+
+fn open_verified_target(target: &Path) -> Result<(std::fs::File, bool), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let exists = match std::fs::symlink_metadata(target) {
+        Ok(meta) if linked(&meta) || !meta.is_file() => return Err("The installation contains a link or a non-file component.".into()),
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).share_mode(FILE_SHARE_READ).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    if !exists {
+        options.create_new(true);
+    }
+    let target_file = options.open(target).map_err(|e| format!("couldn't replace {} ({e})", target.display()))?;
+    if exists {
+        let meta = target_file.metadata().map_err(|e| e.to_string())?;
+        if linked(&meta) || !meta.is_file() {
+            return Err("The installation contains a link or a non-file component.".into());
+        }
+    }
+    Ok((target_file, exists))
+}
+
+fn open_verified_source(source: &Path, expected: &str) -> Result<std::fs::File, String> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut source_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(source)
+        .map_err(|e| format!("couldn't secure the extracted update {} ({e})", source.display()))?;
+    if file_digest(&mut source_file)? != expected {
+        return Err("An extracted update file no longer matches the verified ZIP.".into());
+    }
+    source_file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    Ok(source_file)
+}
+
+fn copy_verified(mut source_file: std::fs::File, mut target_file: std::fs::File, target: &Path, expected: &str) -> Result<std::fs::File, String> {
+    use std::io::{Seek, SeekFrom};
+
+    target_file.set_len(0).map_err(|e| e.to_string())?;
+    target_file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    std::io::copy(&mut source_file, &mut target_file).map_err(|e| format!("couldn't replace {} ({e})", target.display()))?;
+    if file_digest(&mut target_file)? != expected {
+        return Err("An installed update file does not match the verified ZIP.".into());
+    }
+    Ok(target_file)
 }
 
 /// The one folder that holds every file, when there is one.

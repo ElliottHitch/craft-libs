@@ -53,6 +53,15 @@ pub enum Install {
     Standalone(PathBuf),
 }
 
+/// How Windows self-updates authenticate the replacement package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsUpdatePolicy {
+    /// Require the installed program and update to have matching Authenticode signatures.
+    RequireSignature,
+    /// Accept the exact app repository's release after verifying its published checksum.
+    ReleaseChecksum,
+}
+
 impl Install {
     fn kind(&self) -> PackageKind {
         match self {
@@ -344,6 +353,27 @@ pub fn update(
     last: &dyn Fn() -> Result<(), String>,
     running_version: Option<&str>,
 ) -> Result<(), String> {
+    update_with_policy(app, install, release, platform, http, paths, stop, phase, last, running_version, WindowsUpdatePolicy::RequireSignature)
+}
+
+/// Updates with an explicit Windows package policy. The same policy must be passed to
+/// [`finish_with_policy`] when the update helper starts.
+#[allow(clippy::too_many_arguments)]
+pub fn update_with_policy(
+    app: &App,
+    install: &Install,
+    release: &Release,
+    platform: Platform,
+    http: &Http,
+    paths: &Paths,
+    stop: &Stop,
+    phase: &mut dyn FnMut(JobPhase),
+    last: &dyn Fn() -> Result<(), String>,
+    running_version: Option<&str>,
+    policy: WindowsUpdatePolicy,
+) -> Result<(), String> {
+    #[cfg(not(windows))]
+    let _ = policy;
     let cur_v = running_version.and_then(|v| current_version(app, v));
     if let (Some(rel_v), Some(cur_v)) = (release.version.as_ref(), cur_v.as_ref())
         && !version::offers_update(rel_v, cur_v)
@@ -354,12 +384,28 @@ pub fn update(
     }
     let (asset, _) = pick_asset(release, &[app.id], platform, &[install.kind()])
         .ok_or_else(|| format!("{} {} has no {} for {}", app.name, release.version_label(), install.kind().label(), platform.label()))?;
-    let asset = asset.clone();
+    #[allow(unused_mut)]
+    let mut asset = asset.clone();
     crate::install::bind_artifact_version(app, release, &asset)?;
+    #[cfg(windows)]
+    if policy == WindowsUpdatePolicy::ReleaseChecksum {
+        let url = release_asset_url(app, &release.tag, &asset.name, install.kind())?;
+        if asset.url != url {
+            return Err("the update does not belong to this app's release".into());
+        }
+        let checksum = release_checksum(http, app, &release.tag, &asset.name, install.kind())?;
+        if asset.sha256.as_ref().is_some_and(|digest| !digest.eq_ignore_ascii_case(&checksum)) {
+            return Err("the release's checksums disagree, so the update was not installed".into());
+        }
+        asset.sha256 = Some(checksum);
+    }
     let mut job = Job { http, paths, stop, phase, install_locations: &Default::default(), replace: false };
     let file = install::download(release, &asset, &mut job)?;
     #[cfg(windows)]
-    windows_precheck(app, install, paths, &file)?;
+    match policy {
+        WindowsUpdatePolicy::RequireSignature => windows_precheck(app, install, paths, &file)?,
+        WindowsUpdatePolicy::ReleaseChecksum => windows_precheck_checksum(app, install, paths)?,
+    }
     // The restart ends this process: nothing else may be under way.
     last()?;
     phase(JobPhase::Installing);
@@ -405,16 +451,30 @@ pub fn update(
                 relaunch_flatpak_after_exit(app)
             }
             #[cfg(windows)]
-            Install::Msi(exe) => windows_helper(app, paths, pid, exe, &msi_finish(&file)?),
+            Install::Msi(exe) => windows_helper(app, paths, pid, exe, &msi_finish(&file)?, checksum_tag(policy, release)),
             #[cfg(windows)]
             Install::Portable(exe) => {
                 exe.parent().ok_or_else(|| format!("{} isn't in a folder", app.name))?;
-                windows_helper(app, paths, pid, exe, &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING) })
+                windows_helper(
+                    app,
+                    paths,
+                    pid,
+                    exe,
+                    &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING) },
+                    checksum_tag(policy, release),
+                )
             }
             #[cfg(windows)]
             Install::Standalone(exe) => {
                 exe.parent().ok_or_else(|| format!("{} isn't in a folder", app.name))?;
-                windows_helper(app, paths, pid, exe, &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING) })
+                windows_helper(
+                    app,
+                    paths,
+                    pid,
+                    exe,
+                    &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING) },
+                    checksum_tag(policy, release),
+                )
             }
             #[cfg(unix)]
             Install::Standalone(exe) => {
@@ -650,11 +710,16 @@ const HELPER_DIR: &str = "launcher-update-helper";
 #[cfg_attr(not(windows), allow(dead_code))]
 const PORTABLE_STAGING: &str = "launcher-update";
 
+#[cfg(windows)]
+fn checksum_tag(policy: WindowsUpdatePolicy, release: &Release) -> Option<&str> {
+    (policy == WindowsUpdatePolicy::ReleaseChecksum).then_some(release.tag.as_str())
+}
+
 /// Copies this program into the cache and starts the copy as the update helper, which waits for
 /// `pid` to exit, does `finish` and starts `exe`. Run from the cache, the helper doesn't hold the
 /// installed exe that the step replaces.
 #[cfg(windows)]
-fn windows_helper(app: &App, paths: &Paths, pid: u32, exe: &Path, finish: &Finish) -> Result<(), String> {
+fn windows_helper(app: &App, paths: &Paths, pid: u32, exe: &Path, finish: &Finish, tag: Option<&str>) -> Result<(), String> {
     let program = std::env::current_exe().map_err(|e| format!("couldn't find this program ({e})"))?;
     let dir = paths.cache.join(HELPER_DIR);
     // The previous update's copy, when it's still there.
@@ -664,6 +729,9 @@ fn windows_helper(app: &App, paths: &Paths, pid: u32, exe: &Path, finish: &Finis
     std::fs::copy(&program, &helper).map_err(|e| format!("couldn't schedule the update ({e})"))?;
     let mut cmd = process::command(&helper);
     cmd.args(helper_args(pid, exe, finish));
+    if let Some(tag) = tag {
+        cmd.args(["--release-tag", tag]);
+    }
     clear_pretend_version(&mut cmd, app);
     process::spawn_detached(cmd).map_err(|e| format!("couldn't schedule the update ({e})"))
 }
@@ -673,24 +741,47 @@ fn windows_helper(app: &App, paths: &Paths, pid: u32, exe: &Path, finish: &Finis
 /// app is started again even when the step fails: the old copy is then still in place.
 #[cfg(windows)]
 pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
+    finish_with_policy(app, args, WindowsUpdatePolicy::RequireSignature)
+}
+
+/// Finishes an update using the policy selected when it was scheduled.
+#[cfg(windows)]
+pub fn finish_with_policy(app: &App, args: &[OsString], policy: WindowsUpdatePolicy) -> Option<Result<(), String>> {
     if args.first().is_none_or(|a| a != FINISH_FLAG) {
         return None;
     }
+    let (args, tag) = match policy {
+        WindowsUpdatePolicy::RequireSignature => (args, None),
+        WindowsUpdatePolicy::ReleaseChecksum => {
+            let [args @ .., marker, tag] = args else { return Some(Err("the update helper's arguments are incomplete".into())) };
+            if marker != "--release-tag" {
+                return Some(Err("the update helper's arguments are incomplete".into()));
+            }
+            let Some(tag) = tag.to_str() else { return Some(Err("the update helper's release tag is invalid".into())) };
+            (args, Some(tag))
+        }
+    };
     let Some((pid, exe, step)) = parse_helper_args(args) else { return Some(Err("the update helper's arguments are incomplete".into())) };
     let Ok(me) = std::env::current_exe() else { return Some(Err("the update helper couldn't find itself".into())) };
     let paths = match Paths::for_exe(app, &exe) {
         Ok(paths) => paths,
         Err(e) => return Some(Err(e)),
     };
-    // Nothing runs unless this is the app's own update, signed like this helper.
-    if let Err(e) = check_helper(app, &me, &paths, &exe, &step).and_then(|()| signed_like(app, &me, &exe)) {
+    let allowed = check_helper(app, &me, &paths, &exe, &step).and_then(|()| match policy {
+        WindowsUpdatePolicy::RequireSignature => signed_like(app, &me, &exe),
+        WindowsUpdatePolicy::ReleaseChecksum => Ok(()),
+    });
+    if let Err(e) = allowed {
         record_failure(&paths, &e);
         return Some(Err(e));
     }
     // Read before the step: the update may move or replace the old exe.
     let registered =
         matches!(step, Finish::Msi(_)) && matches!(crate::msi_copy::windows::find(app, &exe), Some(crate::msi_copy::MsiCopy::Registered { .. }));
-    let done = run_step(app, &me, pid, &exe, &step, std::time::Duration::from_secs(60));
+    let done = match tag {
+        Some(tag) => run_step_with_policy(app, &me, pid, &exe, &step, std::time::Duration::from_secs(60), Some(tag)),
+        None => run_step(app, &me, pid, &exe, &step, std::time::Duration::from_secs(60)),
+    };
     if let Err(e) = &done {
         record_failure(&paths, e);
     }
@@ -701,7 +792,19 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
     if !restarts(done.is_ok(), exe.is_file()) {
         return Some(done);
     }
-    let started = signed_like(app, &me, &exe)
+    if done.is_err() && policy == WindowsUpdatePolicy::ReleaseChecksum {
+        let original = crate::http::sha256_file(&me);
+        let installed = crate::http::sha256_file(&exe);
+        if !matches!((original, installed), (Ok(original), Ok(installed)) if original == installed) {
+            log::warn!("{} was not restored after the failed update; leaving it stopped", app.name);
+            return Some(done);
+        }
+    }
+    let restart_allowed = match policy {
+        WindowsUpdatePolicy::RequireSignature => signed_like(app, &me, &exe),
+        WindowsUpdatePolicy::ReleaseChecksum => own_executable(app, &exe),
+    };
+    let started = restart_allowed
         .and_then(|()| process::spawn_detached(std::process::Command::new(&exe)).map_err(|e| format!("couldn't start {} ({e})", exe.display())));
     if let Err(e) = &started {
         record_failure(&paths, e);
@@ -712,6 +815,12 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
 /// Finishes an update on non-Windows platforms (no-op helper).
 #[cfg(not(windows))]
 pub fn finish(_app: &App, _args: &[OsString]) -> Option<Result<(), String>> {
+    None
+}
+
+/// Finishes an update on non-Windows platforms (no-op helper).
+#[cfg(not(windows))]
+pub fn finish_with_policy(_app: &App, _args: &[OsString], _policy: WindowsUpdatePolicy) -> Option<Result<(), String>> {
     None
 }
 
@@ -765,6 +874,88 @@ fn windows_precheck(app: &App, install: &Install, paths: &Paths, download: &Path
         }
         _ => Ok(()),
     }
+}
+
+#[cfg(windows)]
+fn windows_precheck_checksum(app: &App, install: &Install, paths: &Paths) -> Result<(), String> {
+    match install {
+        Install::Msi(exe) => {
+            msi_step(app, exe).map(drop).and_then(|()| own_executable(app, exe)).and_then(|()| same_cache_as_helper(app, paths, exe))
+        }
+        Install::Portable(exe) | Install::Standalone(exe) => own_executable(app, exe).and_then(|()| same_cache_as_helper(app, paths, exe)),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn release_asset_url(app: &App, tag: &str, name: &str, kind: PackageKind) -> Result<String, String> {
+    let invalid = || "the update does not belong to this app's release".to_string();
+    let mut repo = app.repo.split('/');
+    let valid_part =
+        |part: &str| !part.is_empty() && part != "." && part != ".." && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    if !matches!((repo.next(), repo.next(), repo.next()), (Some(owner), Some(name), None) if valid_part(owner) && valid_part(name)) {
+        return Err(invalid());
+    }
+    if tag.is_empty() || tag.len() > 64 || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.+".contains(&b)) {
+        return Err(invalid());
+    }
+    let parsed = crate::platform::parse_asset_name(name, &[app.id]).ok_or_else(invalid)?;
+    let tag_version = version::parse(tag).ok_or_else(invalid)?;
+    if parsed.kind != kind
+        || !matches!(parsed.token.as_str(), "windows-x64" | "windows-x86" | "windows-arm64")
+        || version::parse(&parsed.version).as_ref() != Some(&tag_version)
+    {
+        return Err(invalid());
+    }
+    let prefix = crate::release::download_prefix(app.repo);
+    let url = format!("{prefix}{tag}/{name}");
+    if !crate::release::download_url_under(&url, &prefix) {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+#[cfg(windows)]
+fn release_checksum(http: &Http, app: &App, tag: &str, name: &str, kind: PackageKind) -> Result<String, String> {
+    let url = release_asset_url(app, tag, name, kind)?;
+    let (base, _) = url.rsplit_once('/').ok_or("the release URL is invalid")?;
+    let sums = http.get_text(&format!("{base}/SHA256SUMS.txt"))?.ok_or("the release has no SHA256SUMS.txt")?;
+    let mut entries = crate::release::parse_sha256sums(&sums).into_iter().filter(|(_, file)| file == name);
+    let checksum = entries.next().ok_or("the release has no checksum for this update")?.0;
+    if entries.next().is_some() {
+        return Err("the release has multiple checksums for this update".into());
+    }
+    Ok(checksum)
+}
+
+#[cfg(windows)]
+fn hold_verified_update(app: &App, tag: &str, step: &Finish) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use sha2::{Digest, Sha256};
+
+    let (path, kind) = match step {
+        Finish::Msi(path) => (path, PackageKind::Msi),
+        Finish::Portable { zip, .. } => (zip, PackageKind::PortableZip),
+    };
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or("the update file has an invalid name")?;
+    release_asset_url(app, tag, name, kind)?;
+    let user_agent = format!("{}/{}", app.name.replace(' ', "-"), tag.trim_start_matches(['v', 'V']));
+    let http = Http::new(&user_agent)?;
+    let expected = release_checksum(&http, app, tag, name, kind)?;
+    // Deny writes and renames until the installer or extraction has finished reading this file.
+    const FILE_SHARE_READ: u32 = 1;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| format!("couldn't secure the update file {} ({e})", path.display()))?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest).map_err(|e| format!("couldn't verify the update file {} ({e})", path.display()))?;
+    if format!("{:x}", digest.finalize()) != expected {
+        return Err("the update no longer matches its published checksum".into());
+    }
+    Ok(file)
 }
 
 /// Accepts `paths` when the update helper, which finds the app's folders again from `exe`
@@ -882,9 +1073,23 @@ mod wait_watch {
 }
 
 /// Waits up to `wait` for `pid` to exit, does `step` once it has, and removes the download either
-/// way. The MSI, and every program in the portable zip, must be signed like `reference`.
+/// way. The signed policy checks the MSI and every program in the portable zip.
 #[cfg(windows)]
 fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wait: std::time::Duration) -> Result<(), String> {
+    run_step_with_policy(app, reference, pid, exe, step, wait, None)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_step_with_policy(
+    app: &App,
+    reference: &Path,
+    pid: u32,
+    exe: &Path,
+    step: &Finish,
+    wait: std::time::Duration,
+    tag: Option<&str>,
+) -> Result<(), String> {
     #[cfg(test)]
     wait_watch::entered(pid);
     // The test hook needs the result, so it is stored rather than consumed by the branch.
@@ -892,18 +1097,25 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
     #[cfg(test)]
     wait_watch::returned(pid, waited);
     let result = if waited {
-        match step {
-            Finish::Msi(msi) => {
-                signed_like(app, reference, msi).and_then(|()| msi_step(app, exe)).and_then(|step| crate::msi_migrate::windows::run(msi, &step))
-            }
-            Finish::Portable { zip, tmp } => match (exe.parent(), exe.file_name()) {
-                (Some(dir), Some(executable)) => crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
-                    // The expected executable must be signed even when its contents aren't a PE file.
-                    if file.file_name() == Some(executable) || is_program(file) { signed_like(app, reference, file) } else { Ok(()) }
-                }),
-                _ => Err(format!("{} isn't in a folder", app.name)),
-            },
-        }
+        (|| {
+            let held = tag.map(|tag| hold_verified_update(app, tag, step)).transpose()?;
+            let result = match step {
+                Finish::Msi(msi) => {
+                    let allowed = if tag.is_some() { Ok(()) } else { signed_like(app, reference, msi) };
+                    allowed.and_then(|()| msi_step(app, exe)).and_then(|step| crate::msi_migrate::windows::run(msi, &step))
+                }
+                Finish::Portable { zip, tmp } => match (exe.parent(), exe.file_name()) {
+                    (Some(dir), Some(executable)) if tag.is_some() => crate::portable::unpack_verified_over(zip, tmp, dir, executable),
+                    (Some(dir), Some(executable)) => crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
+                        // The executable must be signed even if it is not a PE file.
+                        if file.file_name() == Some(executable) || is_program(file) { signed_like(app, reference, file) } else { Ok(()) }
+                    }),
+                    _ => Err(format!("{} isn't in a folder", app.name)),
+                },
+            };
+            drop(held);
+            result
+        })()
     } else {
         Err(format!("{} was still running after a minute, so the update wasn't installed", app.name))
     };
